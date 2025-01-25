@@ -3,11 +3,14 @@ import axios from "axios";
 import cheerio from "cheerio";
 import { Pinecone } from "pinecone-client";
 import natural from "natural";
+import dotenv from "dotenv";
+
+dotenv.config();
 
 const tokenizer = new natural.SentenceTokenizer();
 
 // Initialize Pinecone
-const pinecone = new Pinecone({ apiKey: "your-pinecone-api-key", environment: "us-west1-gcp" });
+const pinecone = new Pinecone({ apiKey: process.env.PINECONE_API_KEY, environment: "us-west1-gcp" });
 
 // Load the ONNX embedding model and tokenizer
 const embeddingModel = await AutoModel.from_pretrained("Xenova/all-MiniLM-L6-v2");
