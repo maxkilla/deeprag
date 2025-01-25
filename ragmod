@@ -1,0 +1,101 @@
+const axios = require('axios');
+const cheerio = require('cheerio');
+const { OpenAI } = require('openai');
+const { Pinecone } = require('pinecone-client');
+const natural = require('natural');
+const tokenizer = new natural.SentenceTokenizer();
+
+// Initialize OpenAI and Pinecone
+const openai = new OpenAI({ apiKey: 'your-openai-api-key' });
+const pinecone = new Pinecone({ apiKey: 'your-pinecone-api-key', environment: 'us-west1-gcp' });
+
+// Fetch website content
+async function fetchWebsiteContent(url) {
+    try {
+        const response = await axios.get(url);
+        return response.data;
+    } catch (error) {
+        console.error('Error fetching website content:', error);
+        throw error;
+    }
+}
+
+// Clean HTML by removing unwanted elements
+function cleanHtml(html) {
+    const $ = cheerio.load(html);
+    $('script, style, nav, footer, iframe, ads').remove(); // Remove unwanted elements
+    return $('body').text();
+}
+
+// Chunk text by sentences with overlap
+function chunkBySentences(text, maxChunkSize, overlapSize) {
+    const sentences = tokenizer.tokenize(text); // Use Natural's sentence tokenizer
+    const chunks = [];
+    let currentChunk = '';
+
+    for (const sentence of sentences) {
+        if (currentChunk.length + sentence.length <= maxChunkSize) {
+            currentChunk += sentence + ' ';
+        } else {
+            chunks.push(currentChunk.trim());
+            currentChunk = sentence + ' ';
+
+            // Add overlap by including the last few sentences in the next chunk
+            if (overlapSize > 0) {
+                const overlapStart = Math.max(0, chunks.length - overlapSize);
+                currentChunk = chunks.slice(overlapStart).join(' ') + ' ' + currentChunk;
+            }
+        }
+    }
+
+    if (currentChunk.trim()) {
+        chunks.push(currentChunk.trim());
+    }
+
+    return chunks;
+}
+
+// Get embeddings for text (using OpenAI's embeddings API)
+async function getEmbedding(text) {
+    const response = await openai.embeddings.create({
+        input: text,
+        model: 'text-embedding-ada-002',
+    });
+    return response.data[0].embedding;
+}
+
+// Store chunks in Pinecone
+async function storeChunksInPinecone(chunks) {
+    const index = pinecone.index('website-chunks');
+    const vectors = chunks.map((chunk, i) => ({
+        id: `chunk-${i}`,
+        values: await getEmbedding(chunk), // Convert text to embeddings
+        metadata: { text: chunk },
+    }));
+    await index.upsert(vectors);
+}
+
+// Retrieve relevant chunks from Pinecone
+async function retrieveRelevantChunks(query, topK = 5) {
+    const index = pinecone.index('website-chunks');
+    const queryEmbedding = await getEmbedding(query);
+    const results = await index.query({
+        vector: queryEmbedding,
+        topK,
+        includeMetadata: true,
+    });
+    return results.matches.map(match => match.metadata.text);
+}
+
+// Generate response using RAG
+async function generateResponseWithRAG(query) {
+    const relevantChunks = await retrieveRelevantChunks(query);
+    const context = relevantChunks.join('\n\n');
+    const response = await openai.completions.create({
+        model: 'gpt-4',
+        prompt: `Context: ${context}\n\nQuestion: ${query}\nAnswer:`,
+        max_tokens: 150,
+    });
+    return response.choices[0].text;
+}
+
