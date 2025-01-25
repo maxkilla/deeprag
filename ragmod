@@ -1,13 +1,17 @@
-const axios = require('axios');
-const cheerio = require('cheerio');
-const { OpenAI } = require('openai');
-const { Pinecone } = require('pinecone-client');
-const natural = require('natural');
+import { AutoModel, AutoTokenizer } from "@xenova/transformers";
+import axios from "axios";
+import cheerio from "cheerio";
+import { Pinecone } from "pinecone-client";
+import natural from "natural";
+
 const tokenizer = new natural.SentenceTokenizer();
 
-// Initialize OpenAI and Pinecone
-const openai = new OpenAI({ apiKey: 'your-openai-api-key' });
-const pinecone = new Pinecone({ apiKey: 'your-pinecone-api-key', environment: 'us-west1-gcp' });
+// Initialize Pinecone
+const pinecone = new Pinecone({ apiKey: "your-pinecone-api-key", environment: "us-west1-gcp" });
+
+// Load the ONNX embedding model and tokenizer
+const embeddingModel = await AutoModel.from_pretrained("Xenova/all-MiniLM-L6-v2");
+const embeddingTokenizer = await AutoTokenizer.from_pretrained("Xenova/all-MiniLM-L6-v2");
 
 // Fetch website content
 async function fetchWebsiteContent(url) {
@@ -15,7 +19,7 @@ async function fetchWebsiteContent(url) {
         const response = await axios.get(url);
         return response.data;
     } catch (error) {
-        console.error('Error fetching website content:', error);
+        console.error("Error fetching website content:", error);
         throw error;
     }
 }
@@ -23,27 +27,27 @@ async function fetchWebsiteContent(url) {
 // Clean HTML by removing unwanted elements
 function cleanHtml(html) {
     const $ = cheerio.load(html);
-    $('script, style, nav, footer, iframe, ads').remove(); // Remove unwanted elements
-    return $('body').text();
+    $("script, style, nav, footer, iframe, ads").remove(); // Remove unwanted elements
+    return $("body").text();
 }
 
 // Chunk text by sentences with overlap
 function chunkBySentences(text, maxChunkSize, overlapSize) {
     const sentences = tokenizer.tokenize(text); // Use Natural's sentence tokenizer
     const chunks = [];
-    let currentChunk = '';
+    let currentChunk = "";
 
     for (const sentence of sentences) {
         if (currentChunk.length + sentence.length <= maxChunkSize) {
-            currentChunk += sentence + ' ';
+            currentChunk += sentence + " ";
         } else {
             chunks.push(currentChunk.trim());
-            currentChunk = sentence + ' ';
+            currentChunk = sentence + " ";
 
             // Add overlap by including the last few sentences in the next chunk
             if (overlapSize > 0) {
                 const overlapStart = Math.max(0, chunks.length - overlapSize);
-                currentChunk = chunks.slice(overlapStart).join(' ') + ' ' + currentChunk;
+                currentChunk = chunks.slice(overlapStart).join(" ") + " " + currentChunk;
             }
         }
     }
@@ -55,47 +59,87 @@ function chunkBySentences(text, maxChunkSize, overlapSize) {
     return chunks;
 }
 
-// Get embeddings for text (using OpenAI's embeddings API)
+// Get embeddings for text using the ONNX embedding model
 async function getEmbedding(text) {
-    const response = await openai.embeddings.create({
-        input: text,
-        model: 'text-embedding-ada-002',
-    });
-    return response.data[0].embedding;
+    // Tokenize the input text
+    const inputs = await embeddingTokenizer(text, { padding: true, truncation: true });
+
+    // Generate embeddings
+    const outputs = await embeddingModel(inputs);
+
+    // Extract the embeddings (e.g., use the [CLS] token or mean pooling)
+    const embeddings = outputs.last_hidden_state.mean(dim=1); // Mean pooling
+    return embeddings.tolist()[0]; // Convert to a JavaScript array
 }
 
 // Store chunks in Pinecone
 async function storeChunksInPinecone(chunks) {
-    const index = pinecone.index('website-chunks');
-    const vectors = chunks.map((chunk, i) => ({
-        id: `chunk-${i}`,
-        values: await getEmbedding(chunk), // Convert text to embeddings
-        metadata: { text: chunk },
-    }));
+    const index = pinecone.index("website-chunks");
+    const vectors = await Promise.all(
+        chunks.map(async (chunk, i) => ({
+            id: `chunk-${i}`,
+            values: await getEmbedding(chunk), // Convert text to embeddings
+            metadata: { text: chunk },
+        }))
+    );
     await index.upsert(vectors);
 }
 
 // Retrieve relevant chunks from Pinecone
 async function retrieveRelevantChunks(query, topK = 5) {
-    const index = pinecone.index('website-chunks');
+    const index = pinecone.index("website-chunks");
     const queryEmbedding = await getEmbedding(query);
     const results = await index.query({
         vector: queryEmbedding,
         topK,
         includeMetadata: true,
     });
-    return results.matches.map(match => match.metadata.text);
+    return results.matches.map((match) => match.metadata.text);
 }
 
-// Generate response using RAG
-async function generateResponseWithRAG(query) {
+// Generate response using ONNX model
+async function generateResponseWithONNX(query) {
+    // Load the tokenizer and model
+    const tokenizer = await AutoTokenizer.from_pretrained("onnx-community/DeepSeek-R1-Distill-Qwen-1.5B-ONNX");
+    const model = await AutoModelForCausalLM.from_pretrained("onnx-community/DeepSeek-R1-Distill-Qwen-1.5B-ONNX");
+
+    // Retrieve relevant chunks
     const relevantChunks = await retrieveRelevantChunks(query);
-    const context = relevantChunks.join('\n\n');
-    const response = await openai.completions.create({
-        model: 'gpt-4',
-        prompt: `Context: ${context}\n\nQuestion: ${query}\nAnswer:`,
-        max_tokens: 150,
-    });
-    return response.choices[0].text;
+    const context = relevantChunks.join("\n\n");
+
+    // Prepare the input prompt
+    const messages = [
+        { role: "system", content: "You are a helpful assistant." },
+        { role: "user", content: `Context: ${context}\n\nQuestion: ${query}\nAnswer:` },
+    ];
+
+    // Tokenize the input
+    const inputs = tokenizer.apply_chat_template(messages, { tokenize: true, add_generation_prompt: true });
+
+    // Generate the output
+    const outputs = await model.generate(inputs, { max_new_tokens: 512, do_sample: false });
+
+    // Decode the output
+    const generatedText = tokenizer.decode(outputs[0], { skip_special_tokens: true });
+    return generatedText;
 }
 
+// Example usage
+(async () => {
+    const url = "https://example.com"; // Replace with your target URL
+    const maxChunkSize = 500; // Max characters per chunk
+    const overlapSize = 50; // Overlap between chunks
+
+    // Fetch, clean, and chunk website content
+    const html = await fetchWebsiteContent(url);
+    const cleanedText = cleanHtml(html);
+    const chunks = chunkBySentences(cleanedText, maxChunkSize, overlapSize);
+
+    // Store chunks in Pinecone
+    await storeChunksInPinecone(chunks);
+
+    // Example query
+    const query = "What is the main topic of the website?";
+    const response = await generateResponseWithONNX(query);
+    console.log("ONNX Response:", response);
+})();
